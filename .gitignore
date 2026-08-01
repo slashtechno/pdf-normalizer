@@ -1,0 +1,13 @@
+# PDFs (input/output - large, often copyrighted course material)
+pdfs/
+pdfs_normalized/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store

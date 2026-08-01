@@ -1,0 +1,7 @@
+services:
+  normalizer:
+    build: .
+    volumes:
+      - ./pdfs:/app/pdfs
+      - ./pdfs_normalized:/app/pdfs_normalized
+    command: python normalize_pdfs.py
