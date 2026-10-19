@@ -5,6 +5,7 @@
 #   "Pillow",
 #   "numpy",
 #   "pytesseract",
+#   "opencv-python-headless",
 # ]
 # ///
 """
@@ -35,6 +36,7 @@ Every feature below is on by default and can be individually turned off:
   --no-blank-removal      don't drop blank pages
   --no-ocr                 don't add an OCR text layer to rasterized pages
   --no-page-labels          don't detect folios / set PDF page labels
+  --no-tint-removal          don't flatten paper tint / uneven background to white
   --force-rasterize          rasterize every page, even already-digital ones
 
 Run with:  docker compose run normalizer -- [flags]
@@ -46,10 +48,12 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
+import cv2
 import fitz  # pymupdf
 import numpy as np
 import pytesseract
@@ -70,7 +74,18 @@ CROP_MARGIN_MM = 3.5  # physical margin kept around detected content, independen
 BLANK_THRESHOLD = 0.01  # absolute floor: fraction of ink pixels below which a page counts blank
 BG_BORDER_GAP = 40  # gray-level gap between border and interior median that flags a dark scanner bed
 
-PAGE_NUM_MAX_DIGITS = 4  # domain fact (no book has a 5-digit printed folio), not a tuning knob
+JPEG_QUALITY = 88  # page images embedded in the output PDF
+
+# Tint removal: background is estimated on a downscaled copy (cheap, and the
+# background is low-frequency anyway), then divided out of the full-res page.
+TINT_SCALE = 0.25
+TINT_CLOSE_KERNEL = 61  # at TINT_SCALE; wider than any text stroke or gap, so ink vanishes
+TINT_BLUR_SIGMA = 15
+TINT_BLACK_POINT = 110  # contrast curve: normalized gray <= this -> black
+TINT_WHITE_POINT = 235  # ...and >= this -> white
+TINT_GAMMA = 1.3
+
+PAGE_NUM_MAX_DIGITS = 4 # domain fact (no book has a 5-digit printed folio), not a tuning knob
 DIGITAL_TEXT_MIN_CHARS = 20  # non-trivial text extracted directly = treat page as already-digital
 
 
@@ -81,29 +96,37 @@ class Options:
     remove_blank: bool = True
     ocr: bool = True
     page_labels: bool = True
+    tint_removal: bool = True
     force_rasterize: bool = False
 
 
-def parse_args(argv: list[str] | None = None) -> Options:
+def parse_args(argv: list[str] | None = None) -> tuple[Options, list[Path]]:
     p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    p.add_argument(
+        "files", nargs="*", type=Path, metavar="PDF",
+        help=f"PDF files to normalize. Defaults to every *.pdf in {PDFS_DIR}/.",
+    )
     p.add_argument("--no-rotate", action="store_true", help="Don't auto-rotate pages.")
     p.add_argument("--no-crop", action="store_true", help="Don't crop to content.")
     p.add_argument("--no-blank-removal", action="store_true", help="Don't drop blank pages.")
     p.add_argument("--no-ocr", action="store_true", help="Don't add an OCR text layer to rasterized pages.")
     p.add_argument("--no-page-labels", action="store_true", help="Don't detect folios or set PDF page labels.")
+    p.add_argument("--no-tint-removal", action="store_true", help="Don't flatten paper tint/background to white.")
     p.add_argument(
         "--force-rasterize", action="store_true",
         help="Rasterize every page, even ones that already have a text layer.",
     )
     args = p.parse_args(argv)
-    return Options(
+    opts = Options(
         rotate=not args.no_rotate,
         crop=not args.no_crop,
         remove_blank=not args.no_blank_removal,
         ocr=not args.no_ocr,
         page_labels=not args.no_page_labels,
+        tint_removal=not args.no_tint_removal,
         force_rasterize=args.force_rasterize,
     )
+    return opts, args.files
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +217,35 @@ def content_mask(gray: np.ndarray, bg: str) -> np.ndarray:
 
 def is_blank(gray: np.ndarray, bg: str) -> bool:
     return float(content_mask(gray, bg).mean()) < BLANK_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Tint / background removal
+# ---------------------------------------------------------------------------
+
+def remove_tint(img: Image.Image) -> Image.Image:
+    """Flatten paper tint and uneven lighting to white; returns grayscale.
+
+    The background is estimated with a morphological CLOSE (not a median
+    blur): closing only fills dark features narrower than the kernel, so
+    text vanishes from the estimate while a large photo's interior is left
+    alone.  A median blur converges on the photo's own tone instead, and
+    dividing by that turns photos into white halos.  Output stays grayscale
+    (no binarizing) so photos and maps remain readable."""
+    gray = np.array(img.convert("L"))
+    h, w = gray.shape
+    small = cv2.resize(
+        gray, (max(1, round(w * TINT_SCALE)), max(1, round(h * TINT_SCALE))),
+        interpolation=cv2.INTER_AREA,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (TINT_CLOSE_KERNEL, TINT_CLOSE_KERNEL))
+    bg = cv2.morphologyEx(small, cv2.MORPH_CLOSE, kernel)
+    bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=TINT_BLUR_SIGMA)
+    bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)  # (w, h): cv2 order
+
+    flat = np.clip(gray.astype(np.float32) / np.maximum(bg.astype(np.float32), 1.0) * 255.0, 0, 255)
+    t = np.clip((flat - TINT_BLACK_POINT) / (TINT_WHITE_POINT - TINT_BLACK_POINT), 0, 1)
+    return Image.fromarray((t ** TINT_GAMMA * 255.0).astype(np.uint8), "L")
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +371,34 @@ def build_page_labels(numbers: list[int | None]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Page -> single-page PDF
+# ---------------------------------------------------------------------------
+
+def page_to_pdf_bytes(img: Image.Image, dpi: int, ocr: bool) -> bytes:
+    """Encode the page as JPEG and wrap it in a one-page PDF.  The JPEG has
+    to be handed over as a file/stream: given a PIL image, pytesseract (and
+    Pillow's PDF writer) re-encode it losslessly, which bloats the output
+    several-fold for no visible gain on scans."""
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=JPEG_QUALITY)
+    if ocr:
+        # image_to_pdf_or_hocr renders an invisible OCR text layer over
+        # the page image -- works on figures/diagrams too, just
+        # yielding fewer (or zero) recognized words there instead of
+        # failing outright.  Tesseract embeds JPEG input as-is.
+        with tempfile.TemporaryDirectory() as tmp:
+            jpg_path = Path(tmp) / "page.jpg"
+            jpg_path.write_bytes(buf.getvalue())
+            return pytesseract.image_to_pdf_or_hocr(
+                str(jpg_path), extension="pdf", config=f"--dpi {dpi}"
+            )
+    with fitz.open() as doc:
+        page = doc.new_page(width=img.width / dpi * 72, height=img.height / dpi * 72)
+        page.insert_image(page.rect, stream=buf.getvalue())
+        return doc.tobytes()
+
+
+# ---------------------------------------------------------------------------
 # Per-PDF processing
 # ---------------------------------------------------------------------------
 
@@ -367,25 +447,19 @@ def process_pdf(pdf_path: Path, opts: Options) -> None:
             rot_label = f"rotated {rotation}°"
         else:
             rot_label = "upright"
+        # Downstream steps see an image whose polarity may differ from the scan's.
+        work_bg = bg
+        if opts.tint_removal:
+            img = remove_tint(img)
+            work_bg = "light"  # dark scanner beds are divided out to white too
         if opts.crop:
-            img = crop_to_content(img, bg, render_dpi)
+            img = crop_to_content(img, work_bg, render_dpi)
 
-        if opts.ocr:
-            # image_to_pdf_or_hocr renders an invisible OCR text layer over
-            # the page image -- works on figures/diagrams too, just
-            # yielding fewer (or zero) recognized words there instead of
-            # failing outright.
-            page_bytes = pytesseract.image_to_pdf_or_hocr(
-                img, extension="pdf", config=f"--dpi {render_dpi}"
-            )
-        else:
-            buf = BytesIO()
-            img.save(buf, format="PDF", resolution=render_dpi)
-            page_bytes = buf.getvalue()
+        page_bytes = page_to_pdf_bytes(img, render_dpi, ocr=opts.ocr)
         with fitz.open(stream=page_bytes, filetype="pdf") as page_src:
             out_doc.insert_pdf(page_src)
 
-        page_num = detect_page_number(img, bg) if opts.page_labels else None
+        page_num = detect_page_number(img, work_bg) if opts.page_labels else None
         page_numbers.append(page_num)
         kept += 1
         num_label = f", folio {page_num}" if page_num is not None else ""
@@ -411,12 +485,20 @@ def process_pdf(pdf_path: Path, opts: Options) -> None:
 
 
 def main() -> None:
-    opts = parse_args()
-    pdfs = sorted(PDFS_DIR.glob("*.pdf"))
-    if not pdfs:
-        print(f"No PDFs found in {PDFS_DIR}/")
-        sys.exit(1)
-    print(f"Found {len(pdfs)} PDF(s) in {PDFS_DIR}/")
+    opts, files = parse_args()
+    if files:
+        missing = [f for f in files if not f.is_file()]
+        if missing:
+            print("File(s) not found: " + ", ".join(str(f) for f in missing))
+            sys.exit(1)
+        pdfs = files
+        print(f"Processing {len(pdfs)} specified PDF(s)")
+    else:
+        pdfs = sorted(PDFS_DIR.glob("*.pdf"))
+        if not pdfs:
+            print(f"No PDFs found in {PDFS_DIR}/")
+            sys.exit(1)
+        print(f"Found {len(pdfs)} PDF(s) in {PDFS_DIR}/")
     for pdf_path in pdfs:
         process_pdf(pdf_path, opts)
     print(f"\n✓ Done. Output written to {OUTPUT_DIR}/")
